@@ -1330,10 +1330,12 @@ async function callAI(prompt) {
     else return await callChatGPT(prompt, apiKey);
 }
 
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 async function callGemini(prompt, apiKey) {
-    // Current official models (2025) — old ones like 1.5-flash, 2.0-flash are deprecated
-    const models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+    const models = ['gemini-3-flash-preview', 'gemini-2.5-flash'];
     let lastError = '';
+
     for (const model of models) {
         try {
             const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent';
@@ -1346,22 +1348,34 @@ async function callGemini(prompt, apiKey) {
                 },
                 body: JSON.stringify(body)
             });
+
             if (!r.ok) {
                 const err = await r.json().catch(() => ({}));
                 lastError = err.error?.message || r.statusText;
                 console.warn('Gemini ' + model + ' failed:', lastError);
-                if (r.status === 429 || r.status === 404 || lastError.includes('quota') || lastError.includes('not found')) continue;
+
+                // إذا كان الخطأ بسبب كثرة الطلبات، انتظر 3 ثوانٍ ثم جرب النموذج الآخر
+                if (r.status === 429) {
+                    await sleep(3000);
+                    continue;
+                }
+
+                if (r.status === 404 || lastError.includes('not found')) continue;
                 throw new Error('خطأ Gemini: ' + lastError);
             }
             const j = await r.json();
             console.log('Gemini model used:', model);
             return j.candidates?.[0]?.content?.parts?.[0]?.text || '';
         } catch (e) {
-            if (e.message.includes('quota') || e.message.includes('429') || e.message.includes('not found')) { lastError = e.message; continue; }
+            if (e.message.includes('quota') || e.message.includes('429')) {
+                lastError = e.message;
+                await sleep(3000); // تأخير قبل المحاولة التالية
+                continue;
+            }
             throw e;
         }
     }
-    throw new Error('خطأ Gemini: فشل الاتصال بجميع النماذج. تأكد من صحة مفتاح API أو جرّب بعد دقيقة.\n' + lastError);
+    throw new Error('خطأ Gemini: لقد تخطيت الحد المسموح (15 طلب/دقيقة). انتظر دقيقة ثم حاول مجدداً.');
 }
 
 async function callChatGPT(prompt, apiKey) {
@@ -1376,76 +1390,83 @@ async function callChatGPT(prompt, apiKey) {
     return j.choices?.[0]?.message?.content || '';
 }
 
+// سجل الاختيارات السابقة لمنع التكرار (أقصى تكرار لنفس التوليفة = 2)
+const _aiSelectionHistory = [];
+const _AI_MAX_REPEATS = 2;
+const _AI_HISTORY_LIMIT = 200; // بعد 200 اختيار، يُمسح السجل لإعادة التنويع
+
 async function aiRandomSelect() {
     showAIStatus('⏳', 'جاري الاختيار العشوائي...', '');
     try {
-        // Check API key — auto-open settings if missing
-        const apiKey = $('aiApiKey')?.value?.trim();
-        if (!apiKey) {
-            const panel = $('aiSettingsPanel');
-            const toggle = $('aiSettingsToggle');
-            if (panel && !panel.classList.contains('open')) {
-                panel.classList.add('open');
-                if (toggle) toggle.classList.add('open');
+        let surah, reciter, ayahStart, ayahEnd, attempts = 0;
+
+        do {
+            attempts++;
+            // حماية من حلقة لا نهائية
+            if (attempts > 50) {
+                _aiSelectionHistory.length = 0; // مسح السجل وإعادة المحاولة
             }
-            throw new Error('يرجى إدخال مفتاح API في الإعدادات أولاً ⬇️');
-        }
 
-        // Pre-select 10 random candidate surahs to keep prompt small & varied
-        const candidates = [];
-        const usedIdx = new Set();
-        while (candidates.length < 10) {
-            const idx = Math.floor(Math.random() * 114);
-            if (!usedIdx.has(idx) && SURAH_AYAH_COUNTS[idx] >= 3) {
-                usedIdx.add(idx);
-                candidates.push({ num: idx + 1, name: SURAH_NAMES[idx], ayahs: SURAH_AYAH_COUNTS[idx] });
+            // اختيار سورة عشوائية (من 1 إلى 114)
+            surah = Math.floor(Math.random() * 114) + 1;
+
+            // اختيار قارئ عشوائي
+            reciter = Math.floor(Math.random() * RECITERS.length);
+
+            // جلب عدد آيات السورة المختارة
+            const maxAyah = SURAH_AYAH_COUNTS[surah - 1];
+
+            // تنويع طول المقطع: من 2 إلى 7 آيات (مع مراعاة حجم السورة)
+            const maxLen = Math.min(7, maxAyah);
+            const length = Math.floor(Math.random() * (maxLen - 1)) + 2; // 2 إلى maxLen
+
+            // تنويع موضع البداية: أول / وسط / آخر السورة
+            const region = Math.random();
+            if (maxAyah <= length) {
+                // السورة قصيرة — نأخذها من البداية
+                ayahStart = 1;
+            } else if (region < 0.33) {
+                // من أول السورة (الثلث الأول)
+                const third = Math.ceil(maxAyah / 3);
+                const maxStart = Math.min(third, maxAyah - length + 1);
+                ayahStart = Math.floor(Math.random() * maxStart) + 1;
+            } else if (region < 0.66) {
+                // من وسط السورة (الثلث الثاني)
+                const startMin = Math.ceil(maxAyah / 3);
+                const startMax = Math.min(Math.ceil((maxAyah * 2) / 3), maxAyah - length + 1);
+                if (startMax >= startMin) {
+                    ayahStart = Math.floor(Math.random() * (startMax - startMin + 1)) + startMin;
+                } else {
+                    ayahStart = Math.floor(Math.random() * (maxAyah - length + 1)) + 1;
+                }
+            } else {
+                // من آخر السورة (الثلث الأخير)
+                const startMin = Math.ceil((maxAyah * 2) / 3);
+                const startMax = maxAyah - length + 1;
+                if (startMax >= startMin) {
+                    ayahStart = Math.floor(Math.random() * (startMax - startMin + 1)) + startMin;
+                } else {
+                    ayahStart = Math.max(1, maxAyah - length + 1);
+                }
             }
-        }
 
-        // Pick 5 random reciters
-        const recCandidates = [];
-        const usedRec = new Set();
-        while (recCandidates.length < 5 && usedRec.size < RECITERS.length) {
-            const idx = Math.floor(Math.random() * RECITERS.length);
-            if (!usedRec.has(idx)) {
-                usedRec.add(idx);
-                recCandidates.push({ idx, name: RECITERS[idx].name });
+            ayahEnd = ayahStart + length - 1;
+            if (ayahEnd > maxAyah) ayahEnd = maxAyah;
+
+            // التحقق من عدم تكرار نفس التوليفة أكثر من مرتين
+            const key = `${surah}:${ayahStart}-${ayahEnd}`;
+            const count = _aiSelectionHistory.filter(k => k === key).length;
+            if (count < _AI_MAX_REPEATS) {
+                _aiSelectionHistory.push(key);
+                // مسح السجل عند الامتلاء
+                if (_aiSelectionHistory.length > _AI_HISTORY_LIMIT) {
+                    _aiSelectionHistory.splice(0, Math.floor(_AI_HISTORY_LIMIT / 2));
+                }
+                break;
             }
-        }
+        } while (true);
 
-        const surahOpts = candidates.map(c => `${c.num}. ${c.name} (${c.ayahs} آية)`).join('\n');
-        const recOpts = recCandidates.map(r => `${r.idx}. ${r.name}`).join('\n');
-
-        const prompt = `اختر واحدة من السور التالية وقارئ وآيات مناسبة لفيديو YouTube Shorts (30-60 ثانية).
-
-السور المتاحة:
-${surahOpts}
-
-القراء المتاحين:
-${recOpts}
-
-اختر سورة وقارئ ونطاق آيات (2-5 آيات مؤثرة ومعبرة).
-
-أرجع JSON فقط بدون أي نص آخر:
-{"surah": 55, "reciter": 3, "ayahStart": 1, "ayahEnd": 4}`;
-
-        const response = await callAI(prompt);
-        console.log('AI Random Response:', response);
-
-        const match = response.match(/\{[^}]+\}/);
-        if (!match) throw new Error('لم يتم العثور على نتيجة JSON من الذكاء الاصطناعي.');
-
-        const result = JSON.parse(match[0]);
-        const { surah, reciter, ayahStart, ayahEnd } = result;
-        console.log('AI Parsed:', result);
-
-        // Validate
-        if (!surah || surah < 1 || surah > 114) throw new Error('رقم السورة غير صالح: ' + surah);
-        if (reciter === undefined || reciter < 0 || reciter >= RECITERS.length) throw new Error('رقم القارئ غير صالح: ' + reciter);
-        const maxAyah = SURAH_AYAH_COUNTS[surah - 1];
-        if (ayahStart < 1 || ayahEnd > maxAyah || ayahStart > ayahEnd) throw new Error(`نطاق الآيات غير صالح: ${ayahStart}-${ayahEnd} (الحد: ${maxAyah})`);
-
-        // Apply to form
+        // تحديث واجهة المستخدم
         $('surahSelect').value = surah;
         updateAyahLimits();
         $('ayahStart').value = ayahStart;
@@ -1453,10 +1474,10 @@ ${recOpts}
         $('reciterSelect').value = reciter;
         checkWarn();
 
-        showAIStatus('✅', `تم الاختيار: سورة ${SURAH_NAMES[surah - 1]} (${ayahStart}-${ayahEnd}) — ${RECITERS[reciter].name}`, 'success');
+        showAIStatus('✅', `تم الاختيار محلياً: سورة ${SURAH_NAMES[surah - 1]} (${ayahStart}-${ayahEnd}) — ${RECITERS[reciter].name}`, 'success');
     } catch (e) {
         showAIStatus('❌', e.message, 'error');
-        throw e; // Re-throw so aiFullAuto can catch it
+        throw e;
     }
 }
 
