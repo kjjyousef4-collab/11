@@ -1332,50 +1332,80 @@ async function callAI(prompt) {
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// عرض عداد تنازلي مرئي للمستخدم
+async function sleepWithCountdown(seconds, message) {
+    for (let i = seconds; i > 0; i--) {
+        showAIStatus('⏳', `${message} (${i} ثانية متبقية)...`, '');
+        await sleep(1000);
+    }
+}
+
 async function callGemini(prompt, apiKey) {
-    const models = ['gemini-3-flash-preview', 'gemini-2.5-flash'];
+    const models = ['gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'];
     let lastError = '';
+    const MAX_RETRIES = 2; // أقصى عدد محاولات بعد 429
 
     for (const model of models) {
-        try {
-            const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent';
-            const body = { contents: [{ parts: [{ text: prompt }] }] };
-            const r = await fetch(url, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-goog-api-key': apiKey
-                },
-                body: JSON.stringify(body)
-            });
+        for (let retry = 0; retry <= MAX_RETRIES; retry++) {
+            try {
+                if (retry > 0) {
+                    console.log(`⏳ Retry ${retry}/${MAX_RETRIES} for ${model}...`);
+                }
+                const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent';
+                const body = { contents: [{ parts: [{ text: prompt }] }] };
+                const r = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-goog-api-key': apiKey
+                    },
+                    body: JSON.stringify(body)
+                });
 
-            if (!r.ok) {
-                const err = await r.json().catch(() => ({}));
-                lastError = err.error?.message || r.statusText;
-                console.warn('Gemini ' + model + ' failed:', lastError);
+                if (!r.ok) {
+                    const err = await r.json().catch(() => ({}));
+                    lastError = err.error?.message || r.statusText;
+                    console.warn('Gemini ' + model + ' failed:', lastError);
 
-                // إذا كان الخطأ بسبب كثرة الطلبات، انتظر 3 ثوانٍ ثم جرب النموذج الآخر
-                if (r.status === 429) {
-                    await sleep(3000);
-                    continue;
+                    // 429 = تخطي الحصة — كل النماذج تتشارك نفس الحصة
+                    // لذلك ننتظر 60 ثانية ونعيد المحاولة لنفس النموذج
+                    if (r.status === 429 || lastError.includes('quota')) {
+                        if (retry < MAX_RETRIES) {
+                            const waitSec = retry === 0 ? 30 : 60;
+                            await sleepWithCountdown(waitSec, '⚠️ تم تخطي حد الاستخدام المجاني — جاري الانتظار');
+                            continue; // إعادة المحاولة لنفس النموذج
+                        }
+                        // استنفدنا كل المحاولات لهذا النموذج
+                        throw new Error('__QUOTA_EXHAUSTED__');
+                    }
+
+                    // 404 = النموذج غير موجود — ننتقل للنموذج التالي
+                    if (r.status === 404 || lastError.includes('not found')) break;
+
+                    throw new Error('خطأ Gemini: ' + lastError);
                 }
 
-                if (r.status === 404 || lastError.includes('not found')) continue;
-                throw new Error('خطأ Gemini: ' + lastError);
+                const j = await r.json();
+                console.log('✅ Gemini model used:', model);
+                return j.candidates?.[0]?.content?.parts?.[0]?.text || '';
+            } catch (e) {
+                if (e.message === '__QUOTA_EXHAUSTED__') {
+                    // كل المحاولات فشلت — نتوقف بدون تجربة نماذج أخرى
+                    throw new Error('⚠️ تم تخطي حد الاستخدام المجاني (15 طلب/دقيقة أو 1500/يوم).\n\nانتظر دقيقة وحاول مرة أخرى.\n\nتلميح: لو المشكلة مستمرة، ممكن تكون وصلت للحد اليومي (1500 طلب). جرب بعد 24 ساعة أو استخدم مفتاح API مدفوع.');
+                }
+                if (e.message.includes('quota') || e.message.includes('429')) {
+                    lastError = e.message;
+                    if (retry < MAX_RETRIES) {
+                        await sleepWithCountdown(60, '⚠️ تم تخطي حد الاستخدام — جاري الانتظار');
+                        continue;
+                    }
+                    break; // ننتقل للنموذج التالي
+                }
+                throw e;
             }
-            const j = await r.json();
-            console.log('Gemini model used:', model);
-            return j.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        } catch (e) {
-            if (e.message.includes('quota') || e.message.includes('429')) {
-                lastError = e.message;
-                await sleep(3000); // تأخير قبل المحاولة التالية
-                continue;
-            }
-            throw e;
         }
     }
-    throw new Error('خطأ Gemini: لقد تخطيت الحد المسموح (15 طلب/دقيقة). انتظر دقيقة ثم حاول مجدداً.');
+    throw new Error('⚠️ تم تخطي حد الاستخدام المجاني.\n\nانتظر دقيقة ثم حاول مجدداً، أو استخدم مفتاح API مدفوع.\n\n' + lastError);
 }
 
 async function callChatGPT(prompt, apiKey) {
@@ -1481,49 +1511,179 @@ async function aiRandomSelect() {
     }
 }
 
+// قاموس SEO شامل ويوتيوب لإنشاء عناوين ووصف متنوع جداً (ملايين الاحتمالات)
+const SEO_DICTIONARY = {
+    titleHooks: [
+        // عاطفي وإيماني (Emotion & Faith)
+        "تلاوة تريح القلب 🤍", "راحة نفسية لا توصف ✨", "خشوع يبكي العين 🥺", "أجمل تلاوة ستسمعها اليوم 🎧",
+        "اسمع بقلبك 🤍", "علاج ضيق الصدر 🌧️", "صوت ينسيك هموم الدنيا 🌍", "تلاوة تذهب الهم والحزن ✨",
+        "تلاوة تقشعر لها الأبدان ⚡", "أرح مسمعك وقلبك 🍃", "طمأنينة عجيبة في هذا الصوت 🤍", "تلاوة تأخذك لعالم آخر 🕊️",
+        "آيات السكينة والطمأنينة 🌧️", "سبحان من رزقه هذا الصوت �", "تلاوة تلامس الروح ✨", "بكاء وخشوع 😭",
+        "صوت يهز جبال الهموم 🏔️", "سكينة لقلبك المتعب 💔", "هكذا يكون الخشوع الحقيقي 🕊️", "تلاوة تريح الأعصاب 😌",
+        "دواء القلوب الحزينة 🩹", "تلاوة تجعلك تبكي من خشية الله 🥺", "صوت ملائكي حقاً ✨", "استرح قليلاً مع القرآن 🛋️",
+        "جرعة طمأنينة لروحك 💧", "تلاوة تذيب قسوة القلب ❤️‍🩹", "آيات تلامس شغاف القلب 🫀", "تلاوة تُنسيك تعب اليوم 🌙",
+        "علاج القلق والاكتئاب بالقرآن 🤍", "تلاوة هادئة جداً للنوم 💤", "صوت يسلب العقول 🧠", "جمال لا يوصف في هذه التلاوة �",
+        "تلاوة تسكن الروح 🌿", "نقاء في الصوت والتلاوة 💎", "شفاء لما في الصدور ❤️",
+        // جذاب وتشويقي (Clickbait & Hooks)
+        "لن تمل من سماعها 🎧", "خذ دقيقة من وقتك للقرآن ⏳", "أتحداك ألا تبكي 🥺", "أروع ما جود الشيخ �️",
+        "تلاوة نادرة لن تجد مثلها 💎", "استمع ولن تندم أبداً 💯", "الصوت الذي يبحث عنه الملايين 🔍", "تلاوة تريند اليوم 🚀",
+        "أكثر تلاوة مريحة 📱", "مقطع قرآني سيغير يومك 🔄", "تلاوة تخطف الأنفاس 🌬️", "صوت يأسر القلوب من أول ثانية ⏱️",
+        "هل سمعت هذه التلاوة من قبل؟ 🤔", "مقطع قصير وفيه الخير الكثير 📦", "أفضل تلاوة ممكن تسمعها 🥇",
+        // ديني وتذكير (Religious Reflection)
+        "رسالة ربانية لك اليوم 💌", "آيات تهتز لها السماوات والأرض 🌌", "تذكر وقوفك بين يدي الله ⚖️", "وصف الجنة والنار بالقرآن �",
+        "كلام الله عز وجل 📖", "تدبر هذه الآيات العظيمة 🧠", "قرآن كريم 🕋", "آيات الشفاء والرحمة �",
+        "قصص القرآن عبر وعظات 📜", "رحمة الله الواسعة 🌦️", "نداء من الله لك 📞", "ايات الرزق والفرج 💰",
+        "القرآن الكريم شفاء 🩺", "ايات الصبر والاحتساب 🕊️", "عظمة الخالق في آياته 🌌", "تلاوة عطرة مباركة 🌸"
+    ],
+    titleStyles: [
+        "{hook} | سورة {surah} | {reciter}",
+        "سورة {surah} 🤍 {hook} بصوت {reciter}",
+        "{reciter} | سورة {surah} ✨ {hook}",
+        "آيات من سورة {surah} 🎧 {hook} - {reciter}",
+        "{hook} 🥺 سورة {surah} بصوت الشيخ {reciter}",
+        "سورة {surah} كاملة الخشوع 🕋 {reciter} | {hook}",
+        "🔴 {hook} - {reciter} (سورة {surah})",
+        "سورة {surah} بصوت يريح الأعصاب | {reciter} | {hook}",
+        "【سورة {surah}】 {hook} - القارئ {reciter}",
+        "تلاوة خاشعة جداً 🎧 سورة {surah} - {reciter} | {hook}",
+        "الشيخ {reciter} يُبدع في سورة {surah} 🤍 {hook}",
+        "|| سورة {surah} || {reciter} 🕊️ {hook}",
+        "✨ سورة {surah} ✨ {hook} - بصوت {reciter}",
+        "{hook} 👉 سورة {surah} - {reciter}",
+        "استمع بقلبك 🤍 {reciter} تتلو سورة {surah} - {hook}",
+        "القارئ {reciter} | {hook} 🤍 سورة {surah}"
+    ],
+    descIntros: [
+        "استمع إلى هذه التلاوة العطرة والخاشعة التي تريح القلب وتزيل الهم.",
+        "تلاوة تقشعر لها الأبدان وتخشع لها القلوب، لا تحرم نفسك من أجر سماعها.",
+        "لحظات من السكينة والطمأنينة مع كلام الله عز وجل، راحة نفسية لا توصف.",
+        "افصل عن ضجيج العالم دقائق واسترح مع هذا الصوت العذب والآيات البينات.",
+        "تلاوة قرآنية هادئة لعلاج ضيق الصدر والهموم، رزقنا الله وإياكم السكينة.",
+        "شارك الأجر وانشر كلام الله، تلاوة تأخذك لعالم من الهدوء والراحة.",
+        "أجمل أصوات القرآن الكريم، تلاوة تلامس الروح وتريح الأعصاب.",
+        "دع القرآن يكون ربيع قلبك، استمع وتأمل في آيات الله البينات.",
+        "في زحام الحياة، نحتاج جميعاً إلى وقفة مع كلام الله لتطمئن القلوب.",
+        "تلاوة تفوق الوصف في جمالها وخشوعها، نسأل الله أن يرزقنا وإياكم حلاوة الإيمان.",
+        "استمع بقلبك قبل أذنك، آيات تحمل رسائل ربانية تريح النفس المتعبة.",
+        "تلاوة نادرة ومؤثرة تذكرنا بعظمة الخالق ورحمته الواسعة.",
+        "صوت يهز الوجدان ويحرك المشاعر، تلاوة خاشعة من روائع التلاوات.",
+        "نعمة القرآن لا تضاهيها نعمة، استمتع بجمال التلاوة وروعة الأداء.",
+        "آيات السكينة والطمأنينة، نضعها بين أيديكم راجين من الله القبول والأجر.",
+        "اللهم اجعل القرآن الكريم ربيع قلوبنا ونور صدورنا وجلاء أحزاننا.",
+        "نسأل الله أن يجعل هذه التلاوة شفاءً لكل مهموم ومكروب.",
+        "اللهم ارحمنا بالقرآن واجعله لنا إماماً ونوراً وهدى ورحمة.",
+        "يقول تعالى: 'ألا بذكر الله تطمئن القلوب'، استمع واطمئن.",
+        "تلاوة مريحة الأعصاب بصوت شجي يدخل القلب مباشرة بلا استئذان.",
+        "لا شيء يعدل القرآن في طمأنينة القلب وهدوء النفس، تلاوة مباركة."
+    ],
+    descActions: [
+        "لا تنسَ الاشتراك في القناة وتفعيل الجرس 🔔 ليصلك كل جديد من التلاوات الخاشعة.",
+        "ادعم المقطع بالإعجاب والمشاركة الدال على الخير كفاعله ❤️.",
+        "اكتب (الحمد لله) في التعليقات لتكون صدقة جارية لك ✨.",
+        "ساهم في نشر القرآن الكريم بمشاركة هذا المقطع مع من تحب 🔁.",
+        "اشترك بالقناة وشارك الفيديو عسى أن يكون شفيعاً لنا يوم القيامة 🤲.",
+        "اترك أثراً طيباً في التعليقات بالصلاة على النبي ﷺ 🌹.",
+        "إذا أتممت السماع اكتب (سبحان الله وبحمده سبحان الله العظيم) في التعليقات 🍃.",
+        "دعمك للقناة بالاشتراك والإعجاب يساعدنا في الاستمرار في نشر كلام الله 📈.",
+        "شارك هذا المقطع في حالات الواتساب والستوري لتحصد الأجر والثواب 📲.",
+        "هل شعرت براحة بعد السماع؟ أخبرنا في التعليقات واشترك للمزيد 🤍.",
+        "انضم لعائلتنا القرآنية بالاشتراك في القناة وتفعيل التنبيهات 🕋.",
+        "اضغط على زر الإعجاب ليصل هذا الفيديو لأكبر عدد ممكن من المسلمين 👍.",
+        "شارك الفيديو لعله يكون سببًا في هداية شخص ما 🕊️.",
+        "اكتب اسم من أسماء الله الحسنى في التعليقات 🌸.",
+        "لا تخرج قبل أن تصلي على حبيبنا محمد ﷺ 🕌."
+    ],
+    hashtagsCategories: {
+        general: ["#قرآن", "#quran", "#القرآن_الكريم", "#quran_kareem", "#القران", "#قرآن_كريم", "#قرآن_مترجم", "#quran_recitation", "#HolyQuran", "#Koran"],
+        emotions: ["#تلاوة_خاشعة", "#راحة_نفسية", "#تلاوة_هادئة", "#علاج_الضيق", "#طمأنينة", "#خشوع", "#مؤثر", "#تريح_القلب", "#أرح_سمعك", "#سكينة", "#شفاء", "#علاج_الهم"],
+        shorts: ["#shorts", "#youtube_shorts", "#يوتيوب_شورتس", "#شورتس", "#ريلز", "#reels", "#تيك_توك", "#tiktok", "#تريند", "#viral", "#foryou", "#fyp"],
+        islamic: ["#اسلاميات", "#دعاء", "#آيات", "#صدقة_جارية", "#الاسلام", "#islam", "#muslim", "#مسلم", "#الدين", "#سنة", "#دينيات", "#رسالة_لك", "#تذكير"],
+        type: ["#تلاوات", "#صوت_جميل", "#تلاوات_قصيرة", "#خلفيات_قرآن", "#تلاوة_مؤثرة", "#حالات_واتس_قرآن", "#ستوريات_انستا", "#تصميم_قرآن", "#مونتاج_قرآن", "#اقتباسات"]
+    }
+};
+
 async function aiGenerateMeta() {
-    showAIStatus('⏳', 'جاري توليد العنوان والوصف...', '');
+    showAIStatus('⏳', 'جاري توليد العنوان والوصف بخوارزمية متقدمة...', '');
     try {
         const surah = parseInt($('surahSelect').value, 10);
         const start = parseInt($('ayahStart').value, 10);
         const end = parseInt($('ayahEnd').value, 10);
         const recIdx = parseInt($('reciterSelect').value, 10);
+
+        if (!surah || isNaN(recIdx)) {
+            throw new Error('يرجى اختيار السورة والقارئ أولاً');
+        }
+
         const surahName = SURAH_NAMES[surah - 1];
-        const reciterName = RECITERS[recIdx].name;
+        const cleanReciterName = RECITERS[recIdx].name.replace(/^[\u2700-\u27BF]|[\uE000-\uF8FF]|\uD83C[\uDC00-\uDFFF]|\uD83D[\uDC00-\uDFFF]|[\u2011-\u26FF]|\uD83E[\uDD10-\uDDFF]\s*/g, '').trim();
 
-        const prompt = `أنت خبير في SEO ليوتيوب ومتخصص في المحتوى الإسلامي.
+        // 1. توليد العنوان المدمج
+        const hook = SEO_DICTIONARY.titleHooks[Math.floor(Math.random() * SEO_DICTIONARY.titleHooks.length)];
+        const style = SEO_DICTIONARY.titleStyles[Math.floor(Math.random() * SEO_DICTIONARY.titleStyles.length)];
+        const title = style
+            .replace('{hook}', hook)
+            .replace('{surah}', surahName)
+            .replace('{reciter}', cleanReciterName);
 
-قم بإنشاء عنوان ووصف لفيديو YouTube Shorts قرآني بالمعلومات التالية:
-- السورة: ${surahName}
-- الآيات: من ${start} إلى ${end}
-- القارئ: ${reciterName}
+        // 2. توليد الوصف المستهدف بخوارزميات ذكية
+        let intro1 = SEO_DICTIONARY.descIntros[Math.floor(Math.random() * SEO_DICTIONARY.descIntros.length)];
+        let intro2 = SEO_DICTIONARY.descIntros[Math.floor(Math.random() * SEO_DICTIONARY.descIntros.length)];
+        while (intro2 === intro1) {
+            intro2 = SEO_DICTIONARY.descIntros[Math.floor(Math.random() * SEO_DICTIONARY.descIntros.length)];
+        }
 
-المتطلبات:
-1. العنوان يجب أن يكون جذاباً ومتوافقاً مع خوارزمية يوتيوب (أقل من 100 حرف)
-2. الوصف يجب أن يتضمن:
-   - وصف مؤثر للمحتوى
-   - معلومات عن السورة والآيات
-   - اسم القارئ
-   - هاشتاقات مناسبة (#قرآن #shorts #إسلام إلخ)
-   - دعوة للاشتراك والمشاركة
-3. استخدم إيموجي بشكل مناسب
-4. اجعل المحتوى باللغة العربية
+        const action = SEO_DICTIONARY.descActions[Math.floor(Math.random() * SEO_DICTIONARY.descActions.length)];
 
-أرجع النتيجة كـ JSON فقط بدون أي نص إضافي:
-{"title": "العنوان هنا", "description": "الوصف هنا"}`;
+        // بناء الهاشتاجات بطريقة متوازنة
+        const baseTags = [`#سورة_${surahName.replace(/\s+/g, '_')}`];
+        if (cleanReciterName.split(' ').length <= 3) {
+            baseTags.push(`#${cleanReciterName.replace(/\s+/g, '_')}`);
+        }
 
-        const response = await callAI(prompt);
-        const match = response.match(/\{[\s\S]*\}/);
-        if (!match) throw new Error('لم يتم العثور على نتيجة صالحة.');
+        const getRandTags = (arr, count) => {
+            const shuffled = [...arr].sort(() => 0.5 - Math.random());
+            return shuffled.slice(0, count);
+        };
 
-        const result = JSON.parse(match[0]);
-        if (result.title) $('ytTitle').value = result.title;
-        if (result.description) $('ytDescription').value = result.description;
+        const mixedTags = [
+            ...getRandTags(SEO_DICTIONARY.hashtagsCategories.general, 2),
+            ...getRandTags(SEO_DICTIONARY.hashtagsCategories.emotions, 2),
+            ...getRandTags(SEO_DICTIONARY.hashtagsCategories.shorts, 2),
+            ...getRandTags(SEO_DICTIONARY.hashtagsCategories.islamic, 1),
+            ...getRandTags(SEO_DICTIONARY.hashtagsCategories.type, 1)
+        ];
 
-        showAIStatus('✅', 'تم توليد العنوان والوصف بنجاح! يمكنك تعديلهم يدوياً.', 'success');
+        const finalTagsArr = [...new Set([...baseTags, ...mixedTags])];
+        const finalTags = finalTagsArr.sort(() => 0.5 - Math.random()).join(' ');
+
+        // قالب الوصف النهائي
+        const descriptionTemplate = [
+            intro1,
+            intro2,
+            "",
+            "ـــــــــــــــــــــــــــــــــــــــــــــــــــ",
+            `� تفاصيل التلاوة:`,
+            `📖 السورة: ${surahName} (الآيات من ${start} إلى ${end})`,
+            `🎙️ بصوت القارئ الشيخ: ${cleanReciterName}`,
+            "ـــــــــــــــــــــــــــــــــــــــــــــــــــ",
+            "",
+            action,
+            "",
+            "📌 كلمات مفتاحية:",
+            finalTags
+        ].join('\n');
+
+        // 3. تطبيق النتائج على الواجهة
+        if ($('ytTitle')) $('ytTitle').value = title;
+        if ($('ytDescription')) $('ytDescription').value = descriptionTemplate;
+
+        // تأثير تحميل وهمي للإشعار
+        await new Promise(r => setTimeout(r, 600));
+
+        showAIStatus('✅', 'تم إنتاج توليفة يوتيوب حصرية (ملايين الاحتمالات) بنجاح!', 'success');
     } catch (e) {
         showAIStatus('❌', e.message, 'error');
-        throw e; // Re-throw so aiFullAuto can catch it
+        throw e;
     }
 }
 
