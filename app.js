@@ -1331,33 +1331,37 @@ async function callAI(prompt) {
 }
 
 async function callGemini(prompt, apiKey) {
-    // Try standard stable models. Experimental/latest suffixes often cause "not found"
-    const models = [
-        { name: 'gemini-1.5-flash', ver: 'v1beta' },
-        { name: 'gemini-2.0-flash', ver: 'v1beta' },
-        { name: 'gemini-1.5-pro', ver: 'v1beta' }
-    ];
+    // Current official models (2025) — old ones like 1.5-flash, 2.0-flash are deprecated
+    const models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
     let lastError = '';
-    for (const m of models) {
+    for (const model of models) {
         try {
-            const url = 'https://generativelanguage.googleapis.com/' + m.ver + '/models/' + m.name + ':generateContent?key=' + apiKey;
+            const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent';
             const body = { contents: [{ parts: [{ text: prompt }] }] };
-            const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+            const r = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': apiKey
+                },
+                body: JSON.stringify(body)
+            });
             if (!r.ok) {
                 const err = await r.json().catch(() => ({}));
                 lastError = err.error?.message || r.statusText;
+                console.warn('Gemini ' + model + ' failed:', lastError);
                 if (r.status === 429 || r.status === 404 || lastError.includes('quota') || lastError.includes('not found')) continue;
                 throw new Error('خطأ Gemini: ' + lastError);
             }
             const j = await r.json();
-            console.log('Gemini model used:', m.name);
+            console.log('Gemini model used:', model);
             return j.candidates?.[0]?.content?.parts?.[0]?.text || '';
         } catch (e) {
             if (e.message.includes('quota') || e.message.includes('429') || e.message.includes('not found')) { lastError = e.message; continue; }
             throw e;
         }
     }
-    throw new Error('خطأ Gemini: تم تجاوز حد الاستخدام في جميع النماذج. جرّب بعد دقيقة أو استخدم ChatGPT.\n' + lastError);
+    throw new Error('خطأ Gemini: فشل الاتصال بجميع النماذج. تأكد من صحة مفتاح API أو جرّب بعد دقيقة.\n' + lastError);
 }
 
 async function callChatGPT(prompt, apiKey) {
